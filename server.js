@@ -31,6 +31,34 @@ app.use(express.static(path.join(__dirname, 'dist')));
 // re-calls the subscribe endpoint after a restart.
 const { rebuildSubscribedWorkers } = require('./push');
 
+// Dedicated rate limit for the sponsor onboarding route. Each call to
+// buildSponsoredOnboardTx (src/sponsor.js) spends a real sponsored-reserve
+// transaction, so it must not share the generic 'sponsor' bucket used by
+// cheaper sponsor endpoints. This is intentionally stricter than the generic
+// wrapper: a small per-IP window caps how much reserve a single client can
+// burn even if the generic limiter is loosened elsewhere.
+const SPONSOR_ONBOARD_WINDOW_MS = 60 * 1000;
+const SPONSOR_ONBOARD_MAX = 5;
+const sponsorOnboardHits = new Map();
+
+function rateLimitedSponsorOnboard(req, res, next) {
+  const now = Date.now();
+  const key = req.ip || req.connection?.remoteAddress || 'unknown';
+  const entry = sponsorOnboardHits.get(key);
+  if (!entry || now - entry.start >= SPONSOR_ONBOARD_WINDOW_MS) {
+    sponsorOnboardHits.set(key, { start: now, count: 1 });
+    return next();
+  }
+  if (entry.count >= SPONSOR_ONBOARD_MAX) {
+    res.set('Retry-After', String(Math.ceil((entry.start + SPONSOR_ONBOARD_WINDOW_MS - now) / 1000)));
+    return res.status(429).json({ error: 'Too many sponsor onboarding requests' });
+  }
+  entry.count += 1;
+  return next();
+}
+
+app.use('/api/sponsor/onboard', rateLimitedSponsorOnboard);
+
 async function start() {
   await rebuildSubscribedWorkers();
   const port = process.env.PORT || 3000;
