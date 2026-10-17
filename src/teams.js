@@ -37,6 +37,28 @@ export const MAX_TEAM_NAME_LENGTH = 80;
 export const ROLES = Object.freeze(['owner', 'admin', 'member']);
 const RANK = { owner: 3, admin: 2, member: 1 };
 
+/**
+ * Per-address serialization for membership writes. The cap check in
+ * addMembers() reads team-memberships:{address} and then writes it back;
+ * two concurrent calls for the same address (e.g. the same address added
+ * to two teams at once) could both read the same pre-cap list, both pass
+ * the check, and both write — pushing the address past
+ * MAX_TEAMS_PER_ADDRESS. Chaining each address's membership mutations
+ * through a promise queue makes the read-check-write atomic per address,
+ * so the cap holds under concurrency. Keyed by address, so unrelated
+ * addresses never block each other.
+ */
+const membershipLocks = new Map();
+
+function withMembershipLock(address, fn) {
+  const previous = membershipLocks.get(address) || Promise.resolve();
+  const next = previous.then(fn, fn);
+  // Keep the chain alive for the next caller, but don't let a rejection
+  // here surface as an unhandled rejection on the stored tail.
+  membershipLocks.set(address, next.then(() => {}, () => {}));
+  return next;
+}
+
 /** `status` is the HTTP status the route should answer with. */
 export class TeamError extends Error {
   constructor(message, status = 400) {
@@ -77,20 +99,24 @@ async function getMemberships(address) {
 }
 
 async function addMembership(address, teamId) {
-  const existing = await getMemberships(address);
-  if (existing.includes(teamId)) return;
-  if (existing.length >= MAX_TEAMS_PER_ADDRESS) {
-    throw new TeamError(`${address} already belongs to the maximum of ${MAX_TEAMS_PER_ADDRESS} teams`, 409);
-  }
-  await store.set(MEMBERSHIP_PREFIX + address, [teamId, ...existing]);
+  return withMembershipLock(address, async () => {
+    const existing = await getMemberships(address);
+    if (existing.includes(teamId)) return;
+    if (existing.length >= MAX_TEAMS_PER_ADDRESS) {
+      throw new TeamError(`${address} already belongs to the maximum of ${MAX_TEAMS_PER_ADDRESS} teams`, 409);
+    }
+    await store.set(MEMBERSHIP_PREFIX + address, [teamId, ...existing]);
+  });
 }
 
 async function removeMembership(address, teamId) {
-  const existing = await getMemberships(address);
-  const next = existing.filter((id) => id !== teamId);
-  if (next.length === existing.length) return;
-  if (next.length === 0) await store.delete(MEMBERSHIP_PREFIX + address);
-  else await store.set(MEMBERSHIP_PREFIX + address, next);
+  return withMembershipLock(address, async () => {
+    const existing = await getMemberships(address);
+    const next = existing.filter((id) => id !== teamId);
+    if (next.length === existing.length) return;
+    if (next.length === 0) await store.delete(MEMBERSHIP_PREFIX + address);
+    else await store.set(MEMBERSHIP_PREFIX + address, next);
+  });
 }
 
 export async function getTeam(teamId) {
@@ -176,7 +202,9 @@ export async function addMembers(teamId, actor, addresses, role = 'member') {
   if (additions.length === 0) return team;
 
   // Membership caps are checked up front for every address, so a cap hit on
-  // the last address can't leave the first few half-added.
+  // the last address can't leave the first few half-added. The actual write
+  // in addMembership() re-checks the cap under a per-address lock, so a
+  // concurrent add for the same address can't slip past this pre-check.
   const full = [];
   for (const address of additions) {
     if ((await getMemberships(address)).length >= MAX_TEAMS_PER_ADDRESS) full.push(address);
@@ -198,50 +226,6 @@ export async function addMembers(teamId, actor, addresses, role = 'member') {
  * member's role to 'owner' transfers ownership: they become owner and the
  * previous owner becomes an admin, so there's always exactly one owner.
  */
-export async function setMemberRole(teamId, actor, target, role) {
-  if (!ROLES.includes(role)) throw new TeamError(`role must be one of ${ROLES.join(', ')}`);
-  const team = await requireTeamRole(teamId, actor, 'owner');
-  const member = team.members.find((m) => m.address === target);
-  if (!member) throw new TeamError('that address is not a member of this team', 404);
-  if (target === actor) {
-    throw new TeamError('the owner cannot change their own role — transfer ownership to another member instead', 409);
-  }
+export async function setMemberRole(teamId, a
 
-  if (role === 'owner') {
-    team.members.find((m) => m.address === actor).role = 'admin';
-  }
-  member.role = role;
-  return saveTeam(team);
-}
-
-/**
- * Removes a member. Anyone may remove themselves (leave); admins may remove
- * plain members; the owner may remove anyone but themselves. The owner can
- * never leave while they're the owner — transfer first.
- */
-export async function removeMember(teamId, actor, target) {
-  const team = await requireTeamRole(teamId, actor, 'member');
-  const targetRole = roleOf(team, target);
-  if (targetRole === null) throw new TeamError('that address is not a member of this team', 404);
-  if (targetRole === 'owner') {
-    throw new TeamError('the owner cannot be removed — transfer ownership first, or delete the team', 409);
-  }
-  if (target !== actor) {
-    const required = targetRole === 'admin' ? 'owner' : 'admin';
-    if (!hasRole(team, actor, required)) throw new TeamError(`requires the ${required} role on this team`, 403);
-  }
-
-  team.members = team.members.filter((m) => m.address !== target);
-  await saveTeam(team);
-  await removeMembership(target, teamId);
-  return team;
-}
-
-export async function deleteTeam(teamId, actor) {
-  const team = await requireTeamRole(teamId, actor, 'owner');
-  await store.delete(TEAM_PREFIX + teamId);
-  await Promise.all(team.members.map((m) => removeMembership(m.address, teamId)));
-  const known = await listKnownTeamIds();
-  await store.set(TEAM_INDEX_KEY, known.filter((id) => id !== teamId));
-  return true;
-}
+/* … truncated 1980 chars — edit only what you need near the top … */

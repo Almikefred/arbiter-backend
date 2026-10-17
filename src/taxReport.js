@@ -31,6 +31,17 @@ const STROOPS_PER_CENT = 100_000n;
 const US_STATE = /^[A-Z]{2}$/;
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
+/** Earliest tax year the platform could have recorded earnings. Derived
+ * from the platform's launch date (config.launchDate) rather than a
+ * hardcoded constant, so the floor moves with the platform instead of
+ * silently drifting out of date. Falls back to 2020 if no launch date is
+ * configured. */
+export function earliestTaxYear() {
+  const launch = config.launchDate ? new Date(config.launchDate) : null;
+  if (!launch || Number.isNaN(launch.getTime())) return 2020;
+  return launch.getUTCFullYear();
+}
+
 export class TaxReportError extends Error {
   constructor(message, status = 400) {
     super(message);
@@ -43,10 +54,11 @@ export class TaxReportError extends Error {
  * platform could have existed. */
 export function parseTaxYear(value, now = new Date()) {
   const currentYear = now.getUTCFullYear();
+  const minYear = earliestTaxYear();
   if (value === undefined || value === null || value === '') return currentYear - 1;
   const year = Number(value);
-  if (!Number.isInteger(year) || year < 2020 || year > currentYear) {
-    throw new TaxReportError(`year must be an integer between 2020 and ${currentYear}`);
+  if (!Number.isInteger(year) || year < minYear || year > currentYear) {
+    throw new TaxReportError(`year must be an integer between ${minYear} and ${currentYear}`);
   }
   return year;
 }
@@ -190,146 +202,6 @@ export async function buildTaxSummary(workerAddress, year, { includeLines = fals
     meetsReportingThreshold: grossCents >= thresholdCents,
     // Everything a US filing needs that this backend doesn't have yet.
     missing: [
-      ...(!profile ? ['tax profile'] : []),
-      ...(profile?.usPerson && !profile.tinLast4 ? ['TIN'] : []),
-      ...(!config.tax.payerName || !config.tax.payerTin ? ['payer details (TAX_PAYER_NAME / TAX_PAYER_TIN)'] : []),
-    ],
-    generatedAt: new Date().toISOString(),
-  };
+      ..
 
-  if (includeLines) {
-    summary.credits = credits
-      .map((c) => ({
-        date: new Date(c.creditedAt).toISOString(),
-        questionId: c.questionId,
-        amount: stroopsToUsd(c.amountStroops),
-        amountStroops: c.amountStroops,
-        payoutTx: c.payoutTx,
-      }))
-      .sort((a, b) => a.date.localeCompare(b.date));
-    summary.withdrawalLines = withdrawals
-      .map((w) => ({
-        date: new Date(w.withdrawnAt).toISOString(),
-        amount: stroopsToUsd(w.amountStroops),
-        amountStroops: w.amountStroops,
-        txHash: w.txHash,
-        beneficiaryAddress: w.beneficiaryAddress,
-        auto: w.auto,
-      }))
-      .sort((a, b) => a.date.localeCompare(b.date));
-  }
-
-  return summary;
-}
-
-export async function listTaxYears(workerAddress) {
-  return getWorkerEarningYears(workerAddress);
-}
-
-/** Every worker with activity in `year`. `usOnly` limits it to workers
- * whose profile says they're a US person; `reportableOnly` to those at or
- * above the reporting threshold. */
-export async function buildAllTaxSummaries(year, { usOnly = false, reportableOnly = false } = {}) {
-  const workers = await getEarnersForYear(year);
-  const summaries = await Promise.all(workers.map((w) => buildTaxSummary(w, year)));
-  return summaries.filter(
-    (s) => (!usOnly || s.recipient.usPerson === true) && (!reportableOnly || s.meetsReportingThreshold),
-  );
-}
-
-// ---------------------------------------------------------------------
-// CSV export
-// ---------------------------------------------------------------------
-
-function csvCell(value) {
-  if (value === null || value === undefined) return '';
-  let s = String(value);
-  // Spreadsheet formula injection: a cell starting with one of these is
-  // treated as a formula by Excel/Sheets, and legalName is user-supplied.
-  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
-  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-}
-
-function csvRows(rows) {
-  return rows.map((r) => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
-}
-
-/** A worker's own export: a summary block, then one row per credit. */
-export function taxSummaryToCsv(summary) {
-  const r = summary.recipient;
-  const rows = [
-    ['Tax year', summary.taxYear],
-    ['Form', summary.form],
-    ['Payer name', summary.payer.name],
-    ['Payer TIN', summary.payer.tin],
-    ['Payer address', summary.payer.address],
-    ['Recipient Stellar address', r.stellarAddress],
-    ['Recipient legal name', r.legalName],
-    ['Recipient business name', r.businessName],
-    ['Recipient TIN', r.tinMasked],
-    ['Recipient state', r.mailingAddress?.state],
-    ['Box 1 nonemployee compensation (USD)', summary.nonemployeeCompensation],
-    ['Box 4 federal income tax withheld (USD)', summary.federalIncomeTaxWithheld],
-    ['Meets reporting threshold', summary.meetsReportingThreshold ? 'yes' : 'no'],
-    ['Valuation', summary.valuation],
-    [],
-    ['Month', 'Amount (USD)'],
-    ...summary.monthly.map((m) => [m.month, m.amount]),
-    [],
-    ['Date (UTC)', 'Question ID', 'Amount (USD)', 'Payout transaction'],
-    ...(summary.credits || []).map((c) => [c.date, c.questionId, c.amount, c.payoutTx]),
-  ];
-  return csvRows(rows);
-}
-
-/** Admin bulk export: one row per worker, the shape a 1099 filing
- * service's bulk import usually expects. */
-export function taxSummariesToCsv(summaries) {
-  const header = [
-    'tax_year',
-    'stellar_address',
-    'us_person',
-    'legal_name',
-    'business_name',
-    'tin_type',
-    'tin_masked',
-    'address_line1',
-    'address_line2',
-    'city',
-    'state',
-    'postal_code',
-    'country',
-    'box1_nonemployee_compensation',
-    'box4_federal_tax_withheld',
-    ...MONTHS.map((m) => `month_${m.toLowerCase()}`),
-    'credit_count',
-    'meets_reporting_threshold',
-    'missing',
-  ];
-  const rows = summaries.map((s) => {
-    const r = s.recipient;
-    const a = r.mailingAddress || {};
-    return [
-      s.taxYear,
-      r.stellarAddress,
-      r.usPerson === null ? '' : r.usPerson ? 'yes' : 'no',
-      r.legalName,
-      r.businessName,
-      r.tinType,
-      r.tinMasked,
-      a.line1,
-      a.line2,
-      a.city,
-      a.state,
-      a.postalCode,
-      a.country,
-      s.nonemployeeCompensation,
-      s.federalIncomeTaxWithheld,
-      ...s.monthly.map((m) => m.amount),
-      s.creditCount,
-      s.meetsReportingThreshold ? 'yes' : 'no',
-      s.missing.join('; '),
-    ];
-  });
-  return csvRows([header, ...rows]);
-}
+/* … truncated 4704 chars — edit only what you need near the top … */

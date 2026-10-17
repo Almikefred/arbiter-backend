@@ -151,30 +151,40 @@ export async function recordUsage(store, { accountId, endpoint, tier, sandbox, d
  * window of days. `days` is the rolling window (default 30) and `now` is
  * injectable so tests don't depend on the wall clock. Returns
  * `{ accountId, days, total, endpoints: { [endpoint]: { total, tiers: {...} } } }`.
+ *
+ * Issue #332: the original implementation issued one `listKeys()` call per
+ * day in the window (30+ round-trips for the default window, more for larger
+ * caller-supplied `days`). Since every usage key for an account shares the
+ * `usage:{accountId}:` prefix, a single prefix scan covers the whole window;
+ * we then filter to the requested days in memory. This keeps the read cost
+ * flat in the window size instead of linear in it.
  */
 export async function getUsage(store, accountId, { days = 30, now = new Date() } = {}) {
   const endpoints = {};
   let total = 0;
+  const prefix = `usage:${accountId}:`;
+  const wantedDays = new Set();
   for (let i = 0; i < days; i += 1) {
-    const day = new Date(now.getTime() - i * 86400000).toISOString().slice(0, 10);
-    const prefix = `usage:${accountId}:`;
-    const keys = await store.listKeys(`${prefix}*:${day}`);
-    for (const key of keys) {
-      const rest = key.slice(prefix.length);
-      const sep = rest.lastIndexOf(':');
-      if (sep < 0) continue;
-      const endpointTier = rest.slice(0, sep);
-      const tierSep = endpointTier.lastIndexOf(':');
-      if (tierSep < 0) continue;
-      const endpoint = endpointTier.slice(0, tierSep);
-      const tier = endpointTier.slice(tierSep + 1);
-      const count = Number(await store.get(key)) || 0;
-      if (!count) continue;
-      if (!endpoints[endpoint]) endpoints[endpoint] = { total: 0, tiers: {} };
-      endpoints[endpoint].tiers[tier] = (endpoints[endpoint].tiers[tier] || 0) + count;
-      endpoints[endpoint].total += count;
-      total += count;
-    }
+    wantedDays.add(new Date(now.getTime() - i * 86400000).toISOString().slice(0, 10));
+  }
+  const keys = await store.listKeys(`${prefix}*`);
+  for (const key of keys) {
+    const rest = key.slice(prefix.length);
+    const sep = rest.lastIndexOf(':');
+    if (sep < 0) continue;
+    const day = rest.slice(sep + 1);
+    if (!wantedDays.has(day)) continue;
+    const endpointTier = rest.slice(0, sep);
+    const tierSep = endpointTier.lastIndexOf(':');
+    if (tierSep < 0) continue;
+    const endpoint = endpointTier.slice(0, tierSep);
+    const tier = endpointTier.slice(tierSep + 1);
+    const count = Number(await store.get(key)) || 0;
+    if (!count) continue;
+    if (!endpoints[endpoint]) endpoints[endpoint] = { total: 0, tiers: {} };
+    endpoints[endpoint].tiers[tier] = (endpoints[endpoint].tiers[tier] || 0) + count;
+    endpoints[endpoint].total += count;
+    total += count;
   }
   return { accountId, days, total, endpoints };
 }
