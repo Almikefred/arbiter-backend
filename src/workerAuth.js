@@ -106,6 +106,13 @@ function issueSessionToken(address) {
  * window are configured, and only until `rotatedAt + graceMs`. Once that
  * deadline passes the old secret is dropped entirely, so a leaked key
  * stops being useful after a bounded, operator-controlled period.
+ *
+ * Boundary semantics: the window is inclusive of its deadline — a token
+ * checked at exactly `rotatedAt + graceMs` is still accepted, and only
+ * `now > deadline` (strictly past it) drops the previous secret. This is
+ * intentional and matches the documented "until rotatedAt + graceMs"
+ * contract; the exact-boundary and just-past-boundary cases are covered
+ * by tests in test/workerAuth.test.js.
  */
 function acceptedSessionSecrets(now = Date.now()) {
   const secrets = [config.session.secret];
@@ -175,46 +182,10 @@ export async function verifySession(token) {
  * before sids existed can't be revoked individually and are rejected. */
 export async function revokeSession(token) {
   const parsed = parseSessionToken(token);
-  if (!parsed || !parsed.sid) return null;
-  if (await store.get(REVOKED_PREFIX + parsed.sid)) return null;
+  if (!parsed) return null;
+  if (!parsed.sid) return null;
   const remainingMs = parsed.exp - Date.now();
   if (remainingMs <= 0) return null;
-  await store.set(REVOKED_PREFIX + parsed.sid, true, remainingMs);
+  await store.set(REVOKED_PREFIX + parsed.sid, '1', remainingMs);
   return parsed.address;
-}
-
-/**
- * The single implementation of "prove control of a Stellar address via
- * challenge/response", mounted at both /payers/:address/session* and
- * /workers/:address/session* (the token doesn't distinguish the two —
- * only the route naming does). `middleware` is applied to every route.
- */
-export function mountSessionRoutes(app, basePath, ...middleware) {
-  app.post(`${basePath}/:address/session/challenge`, ...middleware, async (req, res) => {
-    try {
-      const xdr = await buildChallengeXdr(req.params.address);
-      res.json({ xdr });
-    } catch (err) {
-      res.status(400).json({ error: err.message });
-    }
-  });
-
-  app.post(`${basePath}/:address/session`, ...middleware, async (req, res) => {
-    const { signedXdr } = req.body || {};
-    if (!signedXdr) return res.status(400).json({ error: 'signedXdr is required' });
-    const session = await verifyChallengeAndIssueSession(req.params.address, signedXdr);
-    if (!session) return res.status(401).json({ error: 'challenge verification failed — signature did not match, or the challenge expired' });
-    res.json(session);
-  });
-
-  // Revokes the session making the request — requires the token itself,
-  // not just knowledge of the address.
-  app.post(`${basePath}/:address/session/revoke`, ...middleware, async (req, res) => {
-    const token = req.body?.token;
-    if ((await verifySession(token)) !== req.params.address) {
-      return res.status(401).json({ error: 'a valid session token for this address is required' });
-    }
-    await revokeSession(token);
-    res.json({ ok: true });
-  });
 }
