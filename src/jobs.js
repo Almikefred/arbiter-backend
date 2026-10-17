@@ -55,6 +55,49 @@ const TERMINAL_STATUSES = new Set(['settled']);
 const SYNTHETIC_INDEX_KEY = 'synthetic-job-ids';
 const MAX_TRACKED_SYNTHETIC_JOBS = 1_000;
 
+// gRPC job-status streaming (issue #76). A gRPC server-streaming call needs to
+// be woken whenever a job's status changes, rather than polling the store on
+// an interval. updateJob() is the single choke point every state transition
+// (awaiting_workers -> reconciling -> settled, plus holding/pending_review)
+// already flows through, so we fan out change notifications from there. This
+// keeps the gRPC stream reflecting exactly the same transitions the REST
+// GET /oracle/:jobId polling endpoint shows, without reimplementing any of
+// the state machine. Listeners are in-process only (the gRPC server runs in
+// the same process as Express), so a plain Map of Sets is sufficient.
+const jobStatusListeners = new Map();
+
+/**
+ * Subscribe to status changes for a single job. Returns an unsubscribe
+ * function. Used by the gRPC server-streaming handler to push updates as
+ * updateJob() writes them.
+ */
+export function onJobStatusChange(jobId, listener) {
+  let set = jobStatusListeners.get(jobId);
+  if (!set) {
+    set = new Set();
+    jobStatusListeners.set(jobId, set);
+  }
+  set.add(listener);
+  return () => {
+    const current = jobStatusListeners.get(jobId);
+    if (!current) return;
+    current.delete(listener);
+    if (current.size === 0) jobStatusListeners.delete(jobId);
+  };
+}
+
+function notifyJobStatusChange(jobId, job) {
+  const set = jobStatusListeners.get(jobId);
+  if (!set) return;
+  for (const listener of set) {
+    try {
+      listener(job);
+    } catch {
+      // A misbehaving listener must never break the state transition itself.
+    }
+  }
+}
+
 async function indexJob(jobId) {
   const known = (await store.get(JOB_INDEX_KEY)) || [];
   if (known.includes(jobId)) return;
@@ -260,6 +303,12 @@ export async function cancelScheduledJob(jobId) {
  * returns 202 immediately once payment is confirmed, and the caller polls
  * GET /oracle/:jobId (or listens on its SSE stream) for the result.
  *
+ * States: [holding ->] awaiting_workers -> reconciling -> settled
+ * `holding` is the undo window (see undoWindow.js) — paid, not yet
+ * dispatched, cancellable until `cancellableUntil`; a cancelled job goes
+ * 
+
+/* … truncated 4798 chars — edit only what you need near the top … */
  * States: [holding ->] [scheduled ->] awaiting_workers -> reconciling -> settled
  * `holding` is the undo window (see undoWindow.js) — paid, not yet
  * dispatched, cancellable until `cancellableUntil`; a cancelled job goes

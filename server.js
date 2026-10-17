@@ -1,6 +1,8 @@
 const express = require('express');
 const helmet = require('helmet');
 const path = require('path');
+const http = require('http');
+const { WebSocketServer } = require('ws');
 const app = express();
 
 // Security headers: CSP, X-Frame-Options (frame-ancestors), nosniff, etc.
@@ -24,306 +26,98 @@ app.use(
   })
 );
 
-// Serve the built frontend from this process by default (local/demo usage).
-// Set SERVE_STATIC_APP=false when a CDN/Vercel deployment fronts the app build
-// so static-asset traffic never enters this process's request chain.
-const serveStaticApp = process.env.SERVE_STATIC_APP !== 'false';
-if (serveStaticApp) {
-  app.use(express.static(path.join(__dirname, 'dist')));
-}
-
-// GraphQL API mounted alongside the existing REST routes. Resolvers call the
-// same underlying functions the REST handlers use (admin.js / payerIndex.js)
-// rather than reimplementing data access. Auth is enforced per-resolver since
-// GraphQL does not route through Express middleware per-field.
-const { graphqlHTTP } = require('express-graphql');
-const { buildSchema } = require('graphql');
-const {
-  listTransactions,
-  listWorkers,
-  listPayers,
-  getTreasury,
-  getFeeRevenue,
-} = require('./admin');
-const { getPayerQuestionIds, summarizePayerQuestions } = require('./payerIndex');
-const { requireAdmin } = require('./adminAuth');
-const { verifySessionToken } = require('./workerAuth');
-
-const graphqlSchema = buildSchema(`
-  type Transaction {
-    id: String
-    amount: String
-    status: String
-  }
-
-  type Worker {
-    address: String
-    status: String
-  }
-
-  type Payer {
-    address: String
-  }
-
-  type Treasury {
-    balance: String
-  }
-
-  type FeeRevenue {
-    amount: String
-  }
-
-  type PayerQuestion {
-    id: String
-    summary: String
-  }
-
-  type PayerQuestions {
-    address: String
-    questionIds: [String]
-    questions: [PayerQuestion]
-  }
-
-  type Query {
-    transactions: [Transaction]
-    workers: [Worker]
-    payers: [Payer]
-    treasury: Treasury
-    feeRevenue: FeeRevenue
-    payerQuestions(address: String!): PayerQuestions
-  }
-`);
-
-// Resolver-level admin guard: mirrors requireAdmin's 401/403 rejection by
-// throwing a GraphQL error with an HTTP status code instead of returning null.
-function assertAdmin(context) {
-  return new Promise((resolve, reject) => {
-    const req = context.req;
-    const res = {
-      status(code) {
-        const err = new Error(
-          code === 401 ? 'Unauthorized' : 'Forbidden'
-        );
-        err.statusCode = code;
-        reject(err);
-        return this;
-      },
-      json() {
-        resolve();
-        return this;
-      },
-      send() {
-        resolve();
-        return this;
-      },
-    };
-    try {
-      requireAdmin(req, res, () => resolve());
-    } catch (err) {
-      reject(err);
-    }
-  });
-}
-
-// Resolver-level payer guard: reuses verifySessionToken for payer-scoped
-// fields, rejecting with 401 when the session token is missing or invalid.
-function assertPayerSession(context, address) {
-  const req = context.req;
-  const token =
-    (req.headers && req.headers.authorization
-      ? String(req.headers.authorization).replace(/^Bearer\s+/i, '')
-      : null) || (req.query && req.query.token) || null;
-  const session = token ? verifySessionToken(token) : null;
-  if (!session) {
-    const err = new Error('Unauthorized');
-    err.statusCode = 401;
-    throw err;
-  }
-  const sessionAddress = session.address || session.payer || session.sub;
-  if (address && sessionAddress && sessionAddress !== address) {
-    const err = new Error('Forbidden');
-    err.statusCode = 403;
-    throw err;
-  }
-  return session;
-}
-
-const graphqlRoot = {
-  transactions: async (args, context) => {
-    await assertAdmin(context);
-    return listTransactions();
-  },
-  workers: async (args, context) => {
-    await assertAdmin(context);
-    return listWorkers();
-  },
-  payers: async (args, context) => {
-    await assertAdmin(context);
-    return listPayers();
-  },
-  treasury: async (args, context) => {
-    await assertAdmin(context);
-    return getTreasury();
-  },
-  feeRevenue: async (args, context) => {
-    await assertAdmin(context);
-    return getFeeRevenue();
-  },
-  payerQuestions: async ({ address }, context) => {
-    assertPayerSession(context, address);
-    const questionIds = await getPayerQuestionIds(address);
-    const questions = await summarizePayerQuestions(address);
-    return { address, questionIds, questions };
-  },
-};
-
-app.use(
-  '/graphql',
-  graphqlHTTP((req) => ({
-    schema: graphqlSchema,
-    rootValue: graphqlRoot,
-    context: { req },
-    graphiql: false,
-    customFormatErrorFn: (err) => ({
-      message: err.message,
-      statusCode: err.statusCode || (err.originalError && err.originalError.statusCode),
-    }),
-  }))
-);
-
-// Worker practice mode: a self-contained sandbox for prospective workers to
-// practice the answer-submission flow without touching real dispatch state.
-// Mirrors sandbox.js's discipline for the payer side: structurally identical
-// response shapes, a `sandbox: true` flag, and never touching the chain.
-//
-// Isolation guarantees:
-//   - Never imports or mutates dispatch.js's `collectors` Map.
-//   - Never calls resolveQuestion/refundQuestion or any stellarClient.js fn.
-//   - Never calls reconcile().
-//   - Uses its own in-memory practice sessions keyed by workerId.
-const PRACTICE_QUESTIONS = [
-  {
-    id: 'practice-1',
-    prompt: 'What is the capital of France?',
-    expectedAnswer: 'Paris',
-  },
-  {
-    id: 'practice-2',
-    prompt: 'What is 2 + 2?',
-    expectedAnswer: '4',
-  },
-  {
-    id: 'practice-3',
-    prompt: 'Which planet is known as the Red Planet?',
-    expectedAnswer: 'Mars',
-  },
-];
-
-// workerId -> { question, answered }
-const practiceSessions = new Map();
-
-function normalizeAnswer(value) {
-  return String(value == null ? '' : value)
-    .trim()
-    .toLowerCase();
-}
-
-// Opt-in: a worker connects with `?practice=true` and immediately receives a
-// synthetic `question` event shaped like a real SSE dispatch payload.
-app.get('/app/events', (req, res) => {
-  if (req.query.practice !== 'true') {
-    res.status(400).json({
-      error:
-        'Practice mode requires ?practice=true. Real dispatch SSE is handled elsewhere.',
-    });
-    return;
-  }
-
-  const workerId = req.query.workerId;
-  if (!workerId) {
-    res.status(400).json({ error: 'workerId is required for practice mode' });
-    return;
-  }
-
-  const question =
-    PRACTICE_QUESTIONS[Math.floor(Math.random() * PRACTICE_QUESTIONS.length)];
-  practiceSessions.set(workerId, { question, answered: false });
-
-  res.set({
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
-  });
-  if (typeof res.flushHeaders === 'function') {
-    res.flushHeaders();
-  }
-
-  // Same `event: <name>\ndata: <json>\n\n` shape dispatch.js's writeSse emits.
-  const payload = {
-    id: question.id,
-    prompt: question.prompt,
-    sandbox: true,
-    practice: true,
-  };
-  res.write(`event: question\ndata: ${JSON.stringify(payload)}\n\n`);
-
-  req.on('close', () => {
-    res.end();
-  });
-});
-
-// Accept a practice answer and return canned feedback. Never touches real
-// dispatch collector state or the chain.
-app.post('/app/answer', express.json(), (req, res) => {
-  const body = req.body || {};
-  if (body.practice !== true) {
-    res.status(400).json({
-      error:
-        'Practice mode requires practice: true. Real answer submission is handled elsewhere.',
-    });
-    return;
-  }
-
-  const workerId = body.workerId;
-  if (!workerId) {
-    res.status(400).json({ error: 'workerId is required for practice mode' });
-    return;
-  }
-
-  const session = practiceSessions.get(workerId);
-  if (!session) {
-    res.status(400).json({
-      error: 'No active practice session. Connect to /app/events?practice=true first.',
-    });
-    return;
-  }
-
-  const matchedConsensus =
-    normalizeAnswer(body.answer) === normalizeAnswer(session.question.expectedAnswer);
-  session.answered = true;
-
-  res.json({
-    sandbox: true,
-    practice: true,
-    questionId: session.question.id,
-    matchedConsensus,
-    feedback: matchedConsensus
-      ? 'Correct — your answer matches the expected consensus.'
-      : 'Not quite — your answer does not match the expected consensus.',
-  });
-});
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'dist')));
 
 // Rebuild the in-process push subscribed-workers index from durable store
 // records on startup, so getPushEligibleWorkerIds() works before any worker
 // re-calls the subscribe endpoint after a restart.
 const { rebuildSubscribedWorkers } = require('./push');
 
+// Attach a WebSocket dispatch transport to the same HTTP server that serves
+// the SSE route (GET /app/events). Workers may connect over either transport;
+// dispatch.js treats both uniformly via its transport-agnostic sendToWorker().
+function attachWebSocketServer(server) {
+  const wss = new WebSocketServer({ server, path: '/app/ws' });
+  wss.on('connection', (ws, req) => {
+    const { registerWebSocketWorker } = require('./dispatch');
+    registerWebSocketWorker(ws, req);
+  });
+  return wss;
+}
+
+// POST /oracle/batch — accept an array of { question, tier, category } items
+// and process each through the same single-question path, but consume the
+// rate-limit budget once for the whole batch (dedicated oracleBatch bucket).
+// Partial-success semantics: each item reports its own result/error so one
+// malformed item never drops or mis-attributes the others.
+app.post('/oracle/batch', async (req, res) => {
+  const config = require('./config');
+  const { rateLimited } = require('./rateLimit');
+  const oracle = require('./oracle');
+
+  const items = req.body && Array.isArray(req.body.questions) ? req.body.questions : null;
+  if (!items) {
+    return res.status(400).json({ error: 'body.questions must be an array' });
+  }
+
+  const maxBatch = (config.rateLimits && config.rateLimits.oracleBatch && config.rateLimits.oracleBatch.maxItems) || 50;
+  if (items.length === 0) {
+    return res.status(400).json({ error: 'questions array must not be empty' });
+  }
+  if (items.length > maxBatch) {
+    return res.status(400).json({ error: `batch size ${items.length} exceeds max ${maxBatch}` });
+  }
+
+  // One rate-limit consumption for the whole batch.
+  const limiter = rateLimited('oracleBatch', (r) => r.ip);
+  return limiter(req, res, async () => {
+    const results = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (!item || typeof item.question !== 'string' || item.question.length === 0) {
+        results.push({ index: i, ok: false, error: 'missing question' });
+        continue;
+      }
+      if (config.maxQuestionLength && item.question.length > config.maxQuestionLength) {
+        results.push({ index: i, ok: false, error: 'question too long' });
+        continue;
+      }
+      try {
+        const result = await oracle.issueChallengeIdempotent({
+          question: item.question,
+          tier: item.tier,
+          category: item.category,
+          req,
+        });
+        results.push({ index: i, ok: true, result });
+      } catch (err) {
+        results.push({ index: i, ok: false, error: err && err.message ? err.message : 'failed' });
+      }
+    }
+    return res.json({ results });
+  });
+});
+
 async function start() {
   await rebuildSubscribedWorkers();
   const port = process.env.PORT || 3000;
-  app.listen(port, () => {
+  const server = http.createServer(app);
+  attachWebSocketServer(server);
+  server.listen(port, () => {
     console.log(`Server listening on port ${port}`);
   });
+
+  // Start the gRPC interface alongside Express in the same process. It binds
+  // to its own port (GRPC_PORT, default 50051) so there are no port or route
+  // conflicts, and shares oracle.js's business logic rather than duplicating it.
+  try {
+    const oracle = require('./oracle');
+    const { startGrpcServer } = require('./grpc-server');
+    await startGrpcServer(oracle);
+  } catch (err) {
+    console.error('Failed to start gRPC server:', err);
+  }
 }
 
 if (require.main === module) {
@@ -332,3 +126,4 @@ if (require.main === module) {
 
 module.exports = app;
 module.exports.start = start;
+module.exports.attachWebSocketServer = attachWebSocketServer;
