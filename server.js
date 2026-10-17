@@ -26,6 +26,7 @@ app.use(
   })
 );
 
+app.use(express.json());
 app.use(express.static(path.join(__dirname, 'dist')));
 
 // Rebuild the in-process push subscribed-workers index from durable store
@@ -44,6 +45,59 @@ function attachWebSocketServer(server) {
   });
   return wss;
 }
+
+// POST /oracle/batch — accept an array of { question, tier, category } items
+// and process each through the same single-question path, but consume the
+// rate-limit budget once for the whole batch (dedicated oracleBatch bucket).
+// Partial-success semantics: each item reports its own result/error so one
+// malformed item never drops or mis-attributes the others.
+app.post('/oracle/batch', async (req, res) => {
+  const config = require('./config');
+  const { rateLimited } = require('./rateLimit');
+  const oracle = require('./oracle');
+
+  const items = req.body && Array.isArray(req.body.questions) ? req.body.questions : null;
+  if (!items) {
+    return res.status(400).json({ error: 'body.questions must be an array' });
+  }
+
+  const maxBatch = (config.rateLimits && config.rateLimits.oracleBatch && config.rateLimits.oracleBatch.maxItems) || 50;
+  if (items.length === 0) {
+    return res.status(400).json({ error: 'questions array must not be empty' });
+  }
+  if (items.length > maxBatch) {
+    return res.status(400).json({ error: `batch size ${items.length} exceeds max ${maxBatch}` });
+  }
+
+  // One rate-limit consumption for the whole batch.
+  const limiter = rateLimited('oracleBatch', (r) => r.ip);
+  return limiter(req, res, async () => {
+    const results = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (!item || typeof item.question !== 'string' || item.question.length === 0) {
+        results.push({ index: i, ok: false, error: 'missing question' });
+        continue;
+      }
+      if (config.maxQuestionLength && item.question.length > config.maxQuestionLength) {
+        results.push({ index: i, ok: false, error: 'question too long' });
+        continue;
+      }
+      try {
+        const result = await oracle.issueChallengeIdempotent({
+          question: item.question,
+          tier: item.tier,
+          category: item.category,
+          req,
+        });
+        results.push({ index: i, ok: true, result });
+      } catch (err) {
+        results.push({ index: i, ok: false, error: err && err.message ? err.message : 'failed' });
+      }
+    }
+    return res.json({ results });
+  });
+});
 
 async function start() {
   await rebuildSubscribedWorkers();
