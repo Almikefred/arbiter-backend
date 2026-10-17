@@ -163,4 +163,8 @@ and against the developer sandbox for a real round trip.
 
 Instead of polling `GE
 
-/* … truncated 8137 chars — edit only what you need near the top … */
+<!-- handsoff-issue-108 -->
+- #108: A public status page reporting real uptime/incident history
+
+<!-- handsoff-issue-84 -->
+- #84: Multi-tenant white-label backend
