@@ -220,14 +220,51 @@ async function createStore() {
   }
   try {
     const { default: Redis } = await import('ioredis');
-    const client = new Redis(config.redisUrl, { lazyConnect: false });
+    const client = new Redis(config.redisUrl, { lazyConnect: false, maxRetriesPerRequest: 2 });
     await client.ping();
     logger.info('Connected to Redis store');
     return new RedisStore(client);
   } catch (err) {
-    logger.warn({ err }, 'Redis unavailable — falling back to in-memory store (single-instance only)');
+    logger.warn({ err }, 'Redis unavailable — falling back to in-memory store');
     return new MemoryStore();
   }
 }
 
-export const store = await createStore();
+let storePromise = null;
+
+/** Lazily-initialized singleton — every caller shares one store instance. */
+export function getStore() {
+  if (!storePromise) storePromise = createStore();
+  return storePromise;
+}
+
+/**
+ * Short-TTL read-through cache for public, unauthenticated query results
+ * (GET /leaderboard, GET /stats). Backed by the shared store so RedisStore
+ * instances see the same cached value across replicas — a process-local
+ * cache would reintroduce per-instance staleness for canary/blue-green
+ * deployments.
+ *
+ * Staleness is bounded by `ttlMs` (seconds, not minutes — leaderboard match
+ * ratios change as questions resolve). A cache-backend outage degrades to
+ * the uncached path: any store error is logged and the caller's `compute()`
+ * runs directly, so a brief Redis blip never turns into a 500.
+ */
+export async function cached(key, ttlMs, compute) {
+  const store = await getStore();
+  try {
+    const hit = await store.get(key);
+    if (hit !== null && hit !== undefined) return hit;
+  } catch (err) {
+    logger.warn({ err, key }, 'cache read failed — falling back to uncached compute');
+    return compute();
+  }
+
+  const value = await compute();
+  try {
+    await store.set(key, value, ttlMs);
+  } catch (err) {
+    logger.warn({ err, key }, 'cache write failed — returning computed value');
+  }
+  return value;
+}

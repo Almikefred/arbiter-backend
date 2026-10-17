@@ -24,21 +24,13 @@ app.use(
   })
 );
 
-// Prometheus metrics registry, registered once at startup. Counters and
-// histograms are incremented at settlement/dispatch/reconcile call sites, so
-// scraping /metrics never triggers a Soroban RPC or Horizon call.
-const { register, metricsContentType } = require('./metrics');
-
-app.get('/metrics', async (req, res) => {
-  try {
-    res.set('Content-Type', metricsContentType);
-    res.send(await register.metrics());
-  } catch (err) {
-    res.status(500).send(String(err && err.message ? err.message : err));
-  }
-});
-
-app.use(express.static(path.join(__dirname, 'dist')));
+// Serve the built frontend from this process by default (local/demo usage).
+// Set SERVE_STATIC_APP=false when a CDN/Vercel deployment fronts the app build
+// so static-asset traffic never enters this process's request chain.
+const serveStaticApp = process.env.SERVE_STATIC_APP !== 'false';
+if (serveStaticApp) {
+  app.use(express.static(path.join(__dirname, 'dist')));
+}
 
 // GraphQL API mounted alongside the existing REST routes. Resolvers call the
 // same underlying functions the REST handlers use (admin.js / payerIndex.js)
