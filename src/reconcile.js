@@ -159,6 +159,18 @@ function getClient() {
  * prompt Claude actually saw contained exactly those submissions.
  */
 export function buildReconcileRequest(question, submissions, model = config.anthropicModel, rule = null) {
+  return {
+    model,
+    max_tokens: 512,
+    tool_choice: { type: 'tool', name: 'report_consensus' },
+    tools: [REPORT_CONSENSUS_TOOL],
+    messages: [{ role: 'user', content: reconcilePrompt(question, submissions, rule) }],
+  };
+}
+
+/** Shared by every provider so the same committed submissions produce the
+ * same prompt text no matter which model answers. */
+function reconcilePrompt(question, submissions, rule) {
   const submissionsText = submissions.map((s) => `Worker ${s.workerId}: "${s.answer}"`).join('\n');
   // Only non-default rules add anything to the prompt, so the default
   // mode's Claude call is unchanged.
@@ -166,24 +178,14 @@ export function buildReconcileRequest(question, submissions, model = config.anth
     rule?.mode === 'numeric-tolerance'
       ? ` The asker requested numeric matching: treat numeric answers ${describeTolerance(rule.tolerance)} as matches.`
       : '';
-  return {
-    model,
-    max_tokens: 512,
-    tool_choice: { type: 'tool', name: 'report_consensus' },
-    tools: [REPORT_CONSENSUS_TOOL],
-    messages: [
-      {
-        role: 'user',
-        content:
-          `Question: "${question}"\n\nWorker answers:\n${submissionsText}\n\n` +
-          'Reconcile these into a single consensus answer. Treat paraphrases, case ' +
-          'differences, and whitespace differences as matches. If the workers genuinely ' +
-          "disagree, pick the winning plurality, lower the confidence accordingly, and only " +
-          "list the winning plurality's worker ids in matching_worker_ids." +
-          ruleText,
-      },
-    ],
-  };
+  return (
+    `Question: "${question}"\n\nWorker answers:\n${submissionsText}\n\n` +
+    'Reconcile these into a single consensus answer. Treat paraphrases, case ' +
+    'differences, and whitespace differences as matches. If the workers genuinely ' +
+    "disagree, pick the winning plurality, lower the confidence accordingly, and only " +
+    "list the winning plurality's worker ids in matching_worker_ids." +
+    ruleText
+  );
 }
 
 /** The parts of a Messages API response worth preserving for provenance —
@@ -204,6 +206,70 @@ async function reconcileWithClaude(question, submissions, rule = null) {
 
   const { consensus, confidence, matching_worker_ids: matchingWorkerIds } = toolUse.input;
   return { consensus, confidence, matchingWorkerIds, method: 'claude', llm: { request, response: captureResponse(message) } };
+}
+
+const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
+// Same ceiling as the Anthropic client. No SDK-style retry here: a failed
+// OpenAI call falls through to the next tier instead of retrying in place.
+const OPENAI_TIMEOUT_MS = 15_000;
+
+/** The OpenAI Chat Completions analogue of buildReconcileRequest(): the same
+ * tool, forced the same way, so the returned shape is identical. */
+export function buildOpenAIReconcileRequest(question, submissions, model = config.openaiModel, rule = null) {
+  return openAIToolRequest(model, REPORT_CONSENSUS_TOOL, reconcilePrompt(question, submissions, rule));
+}
+
+function openAIToolRequest(model, tool, prompt) {
+  return {
+    model,
+    max_completion_tokens: 512,
+    tool_choice: { type: 'function', function: { name: tool.name } },
+    tools: [{ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.input_schema } }],
+    messages: [{ role: 'user', content: prompt }],
+  };
+}
+
+async function postOpenAI(request) {
+  if (!config.openaiApiKey) throw new Error('OPENAI_API_KEY not configured');
+  const res = await fetch(OPENAI_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${config.openaiApiKey}` },
+    body: JSON.stringify(request),
+    signal: AbortSignal.timeout(OPENAI_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`OpenAI API returned HTTP ${res.status}`);
+  return res.json();
+}
+
+/** Normalizes an OpenAI completion's function calls into the same tool_use
+ * block shape captureResponse() keeps for Claude, so provenance stores and
+ * the verifier re-read both providers' tool calls identically. Throws on
+ * malformed tool arguments, which the dispatcher treats as a failed attempt. */
+function captureOpenAIResponse(completion) {
+  const choice = completion.choices?.[0];
+  const calls = choice?.message?.tool_calls || [];
+  return {
+    id: completion.id,
+    model: completion.model,
+    stop_reason: choice?.finish_reason ?? null,
+    content: calls
+      .filter((c) => c.type === 'function')
+      .map((c) => ({ type: 'tool_use', name: c.function.name, input: JSON.parse(c.function.arguments) })),
+  };
+}
+
+async function reconcileWithOpenAI(question, submissions, rule = null) {
+  const request = buildOpenAIReconcileRequest(question, submissions, config.openaiModel, rule);
+  const response = captureOpenAIResponse(await postOpenAI(request));
+
+  const toolUse = response.content.find((b) => b.name === 'report_consensus');
+  if (!toolUse) throw new Error('OpenAI did not return a report_consensus tool call');
+
+  const { consensus, confidence, matching_worker_ids: matchingWorkerIds } = toolUse.input;
+  if (typeof consensus !== 'string' || !Array.isArray(matchingWorkerIds)) {
+    throw new Error('OpenAI report_consensus tool call was missing required fields');
+  }
+  return { consensus, confidence, matchingWorkerIds, method: 'openai', llm: { request, response } };
 }
 
 const REPORT_DRAFT_TOOL = {
@@ -232,9 +298,72 @@ export function buildDraftRequest(question, model = config.anthropicModel) {
     max_tokens: 512,
     tool_choice: { type: 'tool', name: 'report_draft' },
     tools: [REPORT_DRAFT_TOOL],
-    messages: [{ role: 'user', content: `Question: "${question}"\n\nGive your best direct answer.` }],
+    messages: [{ role: 'user', content: draftPrompt(question) }],
   };
 }
+
+function draftPrompt(question) {
+  return `Question: "${question}"\n\nGive your best direct answer.`;
+}
+
+/** The OpenAI analogue of buildDraftRequest(), for the instant tier's fallback. */
+export function buildOpenAIDraftRequest(question, model = config.openaiModel) {
+  return openAIToolRequest(model, REPORT_DRAFT_TOOL, draftPrompt(question));
+}
+
+async function draftWithClaude(question) {
+  const client = getClient();
+  if (!client) throw new Error('ANTHROPIC_API_KEY not configured');
+
+  const request = buildDraftRequest(question);
+  const message = await client.messages.create(request);
+
+  const toolUse = message.content.find((b) => b.type === 'tool_use' && b.name === 'report_draft');
+  if (!toolUse) throw new Error('Claude did not return a report_draft tool call');
+
+  const { answer, confidence } = toolUse.input;
+  return {
+    consensus: answer,
+    confidence,
+    matchingWorkerIds: [],
+    method: 'llm-draft',
+    llm: { request, response: captureResponse(message) },
+  };
+}
+
+async function draftWithOpenAI(question) {
+  const request = buildOpenAIDraftRequest(question);
+  const response = captureOpenAIResponse(await postOpenAI(request));
+
+  const toolUse = response.content.find((b) => b.name === 'report_draft');
+  if (!toolUse) throw new Error('OpenAI did not return a report_draft tool call');
+
+  const { answer, confidence } = toolUse.input;
+  if (typeof answer !== 'string') throw new Error('OpenAI report_draft tool call was missing an answer');
+  return {
+    consensus: answer,
+    confidence,
+    matchingWorkerIds: [],
+    method: 'llm-draft-openai',
+    llm: { request, response },
+  };
+}
+
+/**
+ * LLM providers in fallback order, primary first. An unconfigured provider
+ * is skipped; a configured one that throws (transport error, timeout, or a
+ * missing/malformed tool call) hands off to the next. Only when every
+ * configured provider has failed does the caller use its deterministic path.
+ */
+const RECONCILE_PROVIDERS = [
+  { configured: () => Boolean(config.anthropicApiKey), run: reconcileWithClaude },
+  { configured: () => Boolean(config.openaiApiKey), run: reconcileWithOpenAI },
+];
+
+const DRAFT_PROVIDERS = [
+  { configured: () => Boolean(config.anthropicApiKey), run: draftWithClaude },
+  { configured: () => Boolean(config.openaiApiKey), run: draftWithOpenAI },
+];
 
 /**
  * The `instant` tier's entire fulfillment path — no worker submissions
@@ -249,37 +378,27 @@ export function buildDraftRequest(question, model = config.anthropicModel) {
  * (see oracle.js's fulfillOracleCall); `purpose` only labels the logs.
  */
 export async function draftAnswer(question, questionId, { purpose = 'instant-tier' } = {}) {
-  const client = getClient();
-  if (!client) {
-    logger.warn({ questionId, purpose }, `${purpose} draft requested but ANTHROPIC_API_KEY not configured`);
+  if (!DRAFT_PROVIDERS.some((p) => p.configured())) {
+    logger.warn({ questionId, purpose }, `${purpose} draft requested but no LLM API key configured`);
     return null;
   }
 
-  try {
-    const request = buildDraftRequest(question);
-    const message = await client.messages.create(request);
-
-    const toolUse = message.content.find((b) => b.type === 'tool_use' && b.name === 'report_draft');
-    if (!toolUse) return null;
-
-    const { answer, confidence } = toolUse.input;
-    return {
-      consensus: answer,
-      confidence,
-      matchingWorkerIds: [],
-      method: 'llm-draft',
-      llm: { request, response: captureResponse(message) },
-    };
-  } catch (err) {
-    logger.error({ err, questionId, purpose }, `${purpose} draft answer failed`);
-    return null;
+  for (const provider of DRAFT_PROVIDERS) {
+    if (!provider.configured()) continue;
+    try {
+      return await provider.run(question);
+    } catch (err) {
+      logger.error({ err, questionId, purpose }, `${purpose} draft answer failed, trying next provider`);
+    }
   }
+  return null;
 }
 
 /**
  * reconcile() never throws and never hangs indefinitely on an external API
- * outage — any Claude error falls back to a deterministic vote so the
- * caller can always settle the escrow one way or the other.
+ * outage — LLM providers are tried in order (Claude, then OpenAI), and only
+ * when every configured one has failed does it fall back to a deterministic
+ * vote so the caller can always settle the escrow one way or the other.
  *
  * Fast path: if every worker's answer clusters together (near-duplicate
  * phrasing counts as agreement) AND every one of those workers is
@@ -322,17 +441,22 @@ export async function reconcile(question, submissions, questionId, rule = null) 
     };
   }
 
-  try {
-    return await reconcileWithClaude(question, submissions, rule);
-  } catch (err) {
-    logger.error({ err, questionId }, 'Claude reconciliation failed, falling back to cluster vote');
-    return {
-      consensus: vote.consensus,
-      confidence: vote.confidence,
-      matchingWorkerIds: vote.matchingWorkerIds,
-      method: 'cluster-fallback',
-    };
+  for (const provider of RECONCILE_PROVIDERS) {
+    if (!provider.configured()) continue;
+    try {
+      return await provider.run(question, submissions, rule);
+    } catch (err) {
+      logger.error({ err, questionId }, 'LLM reconciliation failed, trying next provider');
+    }
   }
+
+  logger.error({ questionId }, 'no LLM reconciliation provider answered, falling back to cluster vote');
+  return {
+    consensus: vote.consensus,
+    confidence: vote.confidence,
+    matchingWorkerIds: vote.matchingWorkerIds,
+    method: 'cluster-fallback',
+  };
 }
 
 /**
