@@ -53,6 +53,17 @@ async function start() {
   server.listen(port, () => {
     console.log(`Server listening on port ${port}`);
   });
+
+  // Start the gRPC interface alongside Express in the same process. It binds
+  // to its own port (GRPC_PORT, default 50051) so there are no port or route
+  // conflicts, and shares oracle.js's business logic rather than duplicating it.
+  try {
+    const oracle = require('./oracle');
+    const { startGrpcServer } = require('./grpc-server');
+    await startGrpcServer(oracle);
+  } catch (err) {
+    console.error('Failed to start gRPC server:', err);
+  }
 }
 
 if (require.main === module) {
