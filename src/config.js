@@ -343,6 +343,17 @@ export const config = Object.freeze({
     subject: process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
   }),
 
+  // On-call alerting (alerting.js). Unset ALERT_WEBHOOK_URL disables every
+  // alert, same fail-closed-if-unconfigured pattern as vapid above. Payloads
+  // carry a Slack-compatible `text` field, so a Slack incoming webhook or any
+  // generic JSON receiver works unchanged. The treasury monitor only runs
+  // when ALERT_TREASURY_MIN_USDC is also set.
+  alerting: Object.freeze({
+    webhookUrl: process.env.ALERT_WEBHOOK_URL || '',
+    treasuryMinUsdc: num(process.env.ALERT_TREASURY_MIN_USDC, null),
+    treasuryIntervalMs: num(process.env.ALERT_TREASURY_INTERVAL_MS, 5 * 60 * 1000),
+  }),
+
   push: Object.freeze({
     // Push notifications supplement, never replace, the SSE dispatch
     // channel — they're for workers who aren't currently connected. A

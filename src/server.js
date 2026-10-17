@@ -45,6 +45,7 @@ import { getPrivatePool, addPoolWorkers, removePoolWorkers, PoolValidationError 
 import { isBillingConfigured, createCheckoutSession, handleStripeWebhook, rotateApiKey, getCreditBalanceStroops, reserveCredit, settleReservation } from './billing.js';
 import { registerWebhook, listWebhooks, deleteWebhook, WebhookError } from './webhooks.js';
 import { logger, httpLogger } from './logger.js';
+import { startTreasuryMonitor } from './alerting.js';
 import { getProvenance } from './provenance.js';
 import { enforceSecurityPosture } from './securityPosture.js';
 import {
@@ -1336,6 +1337,7 @@ app.use(express.static(path.join(__dirname, '../../app/dist')));
 
 app.listen(config.port, () => {
   startAutoWithdrawSweep();
+  startTreasuryMonitor();
   logger.info(
     { port: config.port, contractId: config.contractId || null, network: config.networkPassphrase, allowedOrigins: config.allowedOrigins },
     `Arbiter backend listening on :${config.port}`,
