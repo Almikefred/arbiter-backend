@@ -33,6 +33,14 @@ const MAX_TRACKED_REVIEWS = 5_000;
 const ESCALATION_INDEX_KEY = 'escalated-item-ids';
 const MAX_TRACKED_ESCALATIONS = 5_000;
 
+// Scheduled-question index (#80). Holds the jobIds of questions that have been
+// paid for up front but whose dispatch is deferred to a future execute time.
+// Same bounded durable-index pattern as the indexes above; entries are removed
+// once the job is dispatched (or cancelled). The sweep in scheduled.js reads
+// this list and dispatches any job whose `scheduledFor` has arrived.
+const SCHEDULED_INDEX_KEY = 'scheduled-job-ids';
+const MAX_TRACKED_SCHEDULED = 5_000;
+
 // Terminal states never need reconciliation again. Everything else is
 // "in-flight" and must be checked against on-chain truth on startup.
 const TERMINAL_STATUSES = new Set(['settled']);
@@ -223,6 +231,70 @@ export function isSyntheticJob(job) {
   return Boolean(job && job.synthetic);
 }
 
+async function indexScheduled(jobId) {
+  const scheduled = (await store.get(SCHEDULED_INDEX_KEY)) || [];
+  if (scheduled.includes(jobId)) return;
+  await store.set(
+    SCHEDULED_INDEX_KEY,
+    [jobId, ...scheduled].slice(0, MAX_TRACKED_SCHEDULED),
+  );
+}
+
+async function unindexScheduled(jobId) {
+  const scheduled = (await store.get(SCHEDULED_INDEX_KEY)) || [];
+  if (!scheduled.includes(jobId)) return;
+  await store.set(SCHEDULED_INDEX_KEY, scheduled.filter((id) => id !== jobId));
+}
+
+/**
+ * Returns the jobIds currently in the `scheduled` state, most-recent-first.
+ * Backs the scheduling sweep (scheduled.js), which dispatches any job whose
+ * `scheduledFor` has arrived and prunes entries that have left the state.
+ */
+export async function getScheduledJobIds() {
+  return (await store.get(SCHEDULED_INDEX_KEY)) || [];
+}
+
+/**
+ * Returns the full job records currently in `scheduled`, sorted by execute
+ * time ascending (soonest first). Jobs whose record has expired (TTL) or
+ * already left the scheduled state are pruned from the index so the queue
+ * self-heals, mirroring getPendingReviews().
+ */
+export async function getScheduledJobs() {
+  const jobIds = await getScheduledJobIds();
+  const jobs = [];
+  for (const jobId of jobIds) {
+    const job = await getJob(jobId);
+    if (job && job.status === 'scheduled') {
+      jobs.push(job);
+    } else {
+      await unindexScheduled(jobId);
+    }
+  }
+  return jobs.sort((a, b) => (a.scheduledFor || 0) - (b.scheduledFor || 0));
+}
+
+/**
+ * Cancels a scheduled question before its dispatch time. Only valid while the
+ * job is still in `scheduled` — once the sweep has moved it to
+ * `awaiting_workers` the normal undo window / refund path applies instead.
+ * Returns the updated job, or null if the job is missing or no longer
+ * cancellable. Releasing reserved funds is the caller's responsibility (the
+ * route layer refunds the prepaid charge); this only flips the state and
+ * removes the job from the schedule index so it is never dispatched.
+ */
+export async function cancelScheduledJob(jobId) {
+  const job = await getJob(jobId);
+  if (!job || job.status !== 'scheduled') return null;
+  const updated = await updateJob(jobId, {
+    status: 'cancelled',
+    cancelledAt: Date.now(),
+  });
+  await unindexScheduled(jobId);
+  return updated;
+}
+
 /**
  * Async job record for a paid question. Replaces v1's design of holding the
  * client's HTTP request open for up to QUORUM_TIMEOUT_MS while workers
@@ -237,3 +309,12 @@ export function isSyntheticJob(job) {
  * 
 
 /* … truncated 4798 chars — edit only what you need near the top … */
+ * States: [holding ->] [scheduled ->] awaiting_workers -> reconciling -> settled
+ * `holding` is the undo window (see undoWindow.js) — paid, not yet
+ * dispatched, cancellable until `cancellableUntil`; a cancelled job goes
+ * to `cancelled`. `scheduled` (#80) is a paid question whose dispatch is
+ * deferred to `scheduledFor`; the scheduling sweep moves it to
+ * `awaiting_workers` at that time, after which the normal pipeline applies.
+ * A scheduled job cancelled before `scheduledFor` goes straight to
+ * `cancelled` without ever dispatching.
+ */
