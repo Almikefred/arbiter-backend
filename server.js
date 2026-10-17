@@ -24,7 +24,13 @@ app.use(
   })
 );
 
-app.use(express.static(path.join(__dirname, 'dist')));
+// Serve the built frontend from this process by default (local/demo usage).
+// Set SERVE_STATIC_APP=false when a CDN/Vercel deployment fronts the app build
+// so static-asset traffic never enters this process's request chain.
+const serveStaticApp = process.env.SERVE_STATIC_APP !== 'false';
+if (serveStaticApp) {
+  app.use(express.static(path.join(__dirname, 'dist')));
+}
 
 // Rebuild the in-process push subscribed-workers index from durable store
 // records on startup, so getPushEligibleWorkerIds() works before any worker
