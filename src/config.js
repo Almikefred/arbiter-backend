@@ -166,6 +166,12 @@ export const config = Object.freeze({
   // README can distinguish the two environments unambiguously.
   deploymentProfile,
 
+  // LLM provider behind reconcile()/draftAnswer() (see llmProvider.js).
+  // 'anthropic' is the only implementation today; unknown values fail at startup.
+  llmProvider: process.env.LLM_PROVIDER || 'anthropic',
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
+  anthropicModel: process.env.CLAUDE_MODEL || 'claude-sonnet-5-5',
+
   usdc: Object.freeze({
     sacId: process.env.USDC_SAC_ID || '',
     code: process.env.USDC_ASSET_CODE || 'USDC',
