@@ -24,6 +24,20 @@ app.use(
   })
 );
 
+// Prometheus metrics registry, registered once at startup. Counters and
+// histograms are incremented at settlement/dispatch/reconcile call sites, so
+// scraping /metrics never triggers a Soroban RPC or Horizon call.
+const { register, metricsContentType } = require('./metrics');
+
+app.get('/metrics', async (req, res) => {
+  try {
+    res.set('Content-Type', metricsContentType);
+    res.send(await register.metrics());
+  } catch (err) {
+    res.status(500).send(String(err && err.message ? err.message : err));
+  }
+});
+
 app.use(express.static(path.join(__dirname, 'dist')));
 
 // Rebuild the in-process push subscribed-workers index from durable store
