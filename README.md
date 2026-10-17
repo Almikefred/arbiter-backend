@@ -318,3 +318,6 @@ bottleneck (serialized on-chain settlement) are in
 
 <!-- handsoff-issue-108 -->
 - #108: A public status page reporting real uptime/incident history
+
+<!-- handsoff-issue-84 -->
+- #84: Multi-tenant white-label backend
