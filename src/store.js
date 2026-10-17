@@ -127,6 +127,36 @@ class MemoryStore {
     this.map.set(key, { value: current - amount, expiresAt: null });
     return true;
   }
+
+  /** Cluster-wide worker presence: each instance registers its own live
+   * worker count under a per-instance field in one shared hash, so a
+   * cluster-wide total is a sum over fields rather than a per-process
+   * number. MemoryStore has no peers, so its own field is the whole
+   * cluster — identical to today's single-instance behavior. */
+  async setPresence(instanceId, count, ttlMs) {
+    const key = 'presence:workers';
+    const now = Date.now();
+    const entry = this.map.get(key);
+    const alive = entry && (!entry.expiresAt || entry.expiresAt >= now);
+    const hash = alive ? entry.value : {};
+    hash[instanceId] = { count, at: now };
+    this.map.set(key, { value: hash, expiresAt: ttlMs ? now + ttlMs : null });
+  }
+
+  async getPresence() {
+    const key = 'presence:workers';
+    const entry = this.map.get(key);
+    if (!entry) return {};
+    if (entry.expiresAt && entry.expiresAt < Date.now()) {
+      this.map.delete(key);
+      return {};
+    }
+    const result = {};
+    for (const [field, value] of Object.entries(entry.value)) {
+      result[field] = value.count;
+    }
+    return result;
+  }
 }
 
 // Exported (unlike MemoryStore) so its methods are directly unit-testable
@@ -211,6 +241,27 @@ export class RedisStore {
     );
     return result === 1;
   }
+
+  /** Cluster-wide worker presence: one shared hash, one field per instance,
+   * each field carrying that instance's live worker count. A cluster-wide
+   * total is a sum over fields, so a worker connected to instance A is
+   * counted exactly once regardless of which instance asks. The hash TTL
+   * is refreshed on every write so a dead instance's field eventually
+   * expires instead of being counted forever. */
+  async setPresence(instanceId, count, ttlMs) {
+    const key = 'presence:workers';
+    await this.client.hset(key, instanceId, JSON.stringify({ count, at: Date.now() }));
+    if (ttlMs) await this.client.pexpire(key, ttlMs);
+  }
+
+  async getPresence() {
+    const raw = await this.client.hgetall('presence:workers');
+    const result = {};
+    for (const [field, value] of Object.entries(raw)) {
+      result[field] = JSON.parse(value).count;
+    }
+    return result;
+  }
 }
 
 async function createStore() {
@@ -220,9 +271,9 @@ async function createStore() {
   }
   try {
     const { default: Redis } = await import('ioredis');
-    const client = new Redis(config.redisUrl, { lazyConnect: false });
+    const client = new Redis(config.redisUrl, { lazyConnect: false, maxRetriesPerRequest: 3 });
     await client.ping();
-    logger.info('Connected to Redis store');
+    logger.info('Connected to Redis — using RedisStore');
     return new RedisStore(client);
   } catch (err) {
     logger.warn({ err }, 'Redis unavailable — falling back to in-memory store (single-instance only)');
