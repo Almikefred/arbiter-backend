@@ -1,6 +1,8 @@
 const express = require('express');
 const helmet = require('helmet');
 const path = require('path');
+const http = require('http');
+const { WebSocketServer } = require('ws');
 const app = express();
 
 // Security headers: CSP, X-Frame-Options (frame-ancestors), nosniff, etc.
@@ -24,6 +26,7 @@ app.use(
   })
 );
 
+app.use(express.json());
 app.use(express.static(path.join(__dirname, 'dist')));
 
 // Rebuild the in-process push subscribed-workers index from durable store
@@ -62,9 +65,22 @@ app.use('/api/sponsor/onboard', rateLimitedSponsorOnboard);
 async function start() {
   await rebuildSubscribedWorkers();
   const port = process.env.PORT || 3000;
-  app.listen(port, () => {
+  const server = http.createServer(app);
+  attachWebSocketServer(server);
+  server.listen(port, () => {
     console.log(`Server listening on port ${port}`);
   });
+
+  // Start the gRPC interface alongside Express in the same process. It binds
+  // to its own port (GRPC_PORT, default 50051) so there are no port or route
+  // conflicts, and shares oracle.js's business logic rather than duplicating it.
+  try {
+    const oracle = require('./oracle');
+    const { startGrpcServer } = require('./grpc-server');
+    await startGrpcServer(oracle);
+  } catch (err) {
+    console.error('Failed to start gRPC server:', err);
+  }
 }
 
 if (require.main === module) {
@@ -73,3 +89,4 @@ if (require.main === module) {
 
 module.exports = app;
 module.exports.start = start;
+module.exports.attachWebSocketServer = attachWebSocketServer;

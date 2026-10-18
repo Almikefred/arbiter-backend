@@ -15,6 +15,12 @@
  * own per-endpoint/per-tier call patterns via GET /billing/usage. These are
  * written from the same resolveApiKey()-gated request flow as the platform
  * counters and, like the platform counters, exclude sandbox traffic.
+ *
+ * Issue #93 adds a short-TTL cache in front of getStats()'s two-counter read
+ * so request-volume spikes on the public, unauthenticated /stats endpoint
+ * don't hammer the Redis connection. The cache lives in store.js (shared
+ * across instances, same shape as anchorClient.js's stellar.toml cache) and
+ * degrades to the uncached read if the cache backend is briefly unreachable.
  */
 import { store } from './store.js';
 
@@ -26,22 +32,48 @@ import { store } from './store.js';
  */
 const PREFIX = 'stats:';
 
+/**
+ * Short TTL for the cached /stats read. Seconds, not minutes: the counters
+ * are cheap to recompute, so the cache only needs to absorb request-volume
+ * spikes. Staleness is bounded by this window.
+ */
+export const STATS_CACHE_TTL_MS = 5 * 1000;
+const STATS_CACHE_KEY = PREFIX + 'cache:summary';
+
 export async function incrementStat(name) {
   await store.incr(PREFIX + name);
 }
 
 export async function getStats() {
+  // Serve from the shared cache when available. Any cache-backend failure
+  // (e.g. Redis briefly unreachable) falls through to the uncached read so
+  // /stats degrades to current behavior rather than a 500.
+  try {
+    const cached = await store.get(STATS_CACHE_KEY);
+    if (cached) return cached;
+  } catch {
+    // Ignore cache read failures and recompute below.
+  }
+
   const [totalResolved, totalRefunded] = await Promise.all([
     store.get(PREFIX + 'resolved'),
     store.get(PREFIX + 'refunded'),
   ]);
   const resolved = totalResolved || 0;
   const refunded = totalRefunded || 0;
-  return {
+  const result = {
     totalResolved: resolved,
     totalRefunded: refunded,
     totalSettled: resolved + refunded,
   };
+
+  try {
+    await store.set(STATS_CACHE_KEY, result, STATS_CACHE_TTL_MS);
+  } catch {
+    // Cache write failures are non-fatal; the uncached result is still valid.
+  }
+
+  return result;
 }
 
 export function emptyStats() {
@@ -119,30 +151,40 @@ export async function recordUsage(store, { accountId, endpoint, tier, sandbox, d
  * window of days. `days` is the rolling window (default 30) and `now` is
  * injectable so tests don't depend on the wall clock. Returns
  * `{ accountId, days, total, endpoints: { [endpoint]: { total, tiers: {...} } } }`.
+ *
+ * Issue #332: the original implementation issued one `listKeys()` call per
+ * day in the window (30+ round-trips for the default window, more for larger
+ * caller-supplied `days`). Since every usage key for an account shares the
+ * `usage:{accountId}:` prefix, a single prefix scan covers the whole window;
+ * we then filter to the requested days in memory. This keeps the read cost
+ * flat in the window size instead of linear in it.
  */
 export async function getUsage(store, accountId, { days = 30, now = new Date() } = {}) {
   const endpoints = {};
   let total = 0;
+  const prefix = `usage:${accountId}:`;
+  const wantedDays = new Set();
   for (let i = 0; i < days; i += 1) {
-    const day = new Date(now.getTime() - i * 86400000).toISOString().slice(0, 10);
-    const prefix = `usage:${accountId}:`;
-    const keys = await store.listKeys(`${prefix}*:${day}`);
-    for (const key of keys) {
-      const rest = key.slice(prefix.length);
-      const sep = rest.lastIndexOf(':');
-      if (sep < 0) continue;
-      const endpointTier = rest.slice(0, sep);
-      const tierSep = endpointTier.lastIndexOf(':');
-      if (tierSep < 0) continue;
-      const endpoint = endpointTier.slice(0, tierSep);
-      const tier = endpointTier.slice(tierSep + 1);
-      const count = Number(await store.get(key)) || 0;
-      if (!count) continue;
-      if (!endpoints[endpoint]) endpoints[endpoint] = { total: 0, tiers: {} };
-      endpoints[endpoint].tiers[tier] = (endpoints[endpoint].tiers[tier] || 0) + count;
-      endpoints[endpoint].total += count;
-      total += count;
-    }
+    wantedDays.add(new Date(now.getTime() - i * 86400000).toISOString().slice(0, 10));
+  }
+  const keys = await store.listKeys(`${prefix}*`);
+  for (const key of keys) {
+    const rest = key.slice(prefix.length);
+    const sep = rest.lastIndexOf(':');
+    if (sep < 0) continue;
+    const day = rest.slice(sep + 1);
+    if (!wantedDays.has(day)) continue;
+    const endpointTier = rest.slice(0, sep);
+    const tierSep = endpointTier.lastIndexOf(':');
+    if (tierSep < 0) continue;
+    const endpoint = endpointTier.slice(0, tierSep);
+    const tier = endpointTier.slice(tierSep + 1);
+    const count = Number(await store.get(key)) || 0;
+    if (!count) continue;
+    if (!endpoints[endpoint]) endpoints[endpoint] = { total: 0, tiers: {} };
+    endpoints[endpoint].tiers[tier] = (endpoints[endpoint].tiers[tier] || 0) + count;
+    endpoints[endpoint].total += count;
+    total += count;
   }
   return { accountId, days, total, endpoints };
 }

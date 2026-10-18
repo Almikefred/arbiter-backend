@@ -95,6 +95,37 @@ export function requireAdmin(required = ROLE_FULL) {
 }
 
 /**
+ * Resolver-level admin guard for GraphQL (#74). GraphQL doesn't route
+ * through Express middleware per-field the way REST routes do, so admin
+ * fields call this directly from their resolvers. It reuses the exact same
+ * credential check as `requireAdmin` (via `resolveAdminCredential`) so the
+ * two surfaces can never drift apart, and throws a GraphQLError carrying
+ * the same 401/403 status the REST middleware would return — an
+ * unauthenticated admin query is rejected, never silently resolved to null.
+ *
+ * `context` is the per-request GraphQL context; the bearer token is read
+ * from `context.req.headers.authorization`, mirroring the REST middleware.
+ */
+export function requireAdminResolver(context, required = ROLE_FULL) {
+  const header = (context && context.req && context.req.headers.authorization) || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const cred = resolveAdminCredential(token);
+
+  if (!cred) {
+    const err = new Error('unauthorized');
+    err.extensions = { code: 'UNAUTHENTICATED', http: { status: 401 } };
+    throw err;
+  }
+  if (!roleSatisfies(cred.role, required)) {
+    const err = new Error('forbidden');
+    err.extensions = { code: 'FORBIDDEN', http: { status: 403 }, requiredRole: required };
+    throw err;
+  }
+
+  return cred;
+}
+
+/**
  * Roles an authenticated admin may act as. `reviewer` handles the manual
  * review queue (#123) and disputes (#124); `senior_reviewer` is the
  * designated escalation target (#125). Kept as a plain list so the set of

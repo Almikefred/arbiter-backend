@@ -166,6 +166,12 @@ export const config = Object.freeze({
   // README can distinguish the two environments unambiguously.
   deploymentProfile,
 
+  // LLM provider behind reconcile()/draftAnswer() (see llmProvider.js).
+  // 'anthropic' is the only implementation today; unknown values fail at startup.
+  llmProvider: process.env.LLM_PROVIDER || 'anthropic',
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
+  anthropicModel: process.env.CLAUDE_MODEL || 'claude-sonnet-5-5',
+
   usdc: Object.freeze({
     sacId: process.env.USDC_SAC_ID || '',
     code: process.env.USDC_ASSET_CODE || 'USDC',
@@ -332,6 +338,17 @@ export const config = Object.freeze({
     publicKey: process.env.VAPID_PUBLIC_KEY || '',
     privateKey: process.env.VAPID_PRIVATE_KEY || '',
     subject: process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
+  }),
+
+  // On-call alerting (alerting.js). Unset ALERT_WEBHOOK_URL disables every
+  // alert, same fail-closed-if-unconfigured pattern as vapid above. Payloads
+  // carry a Slack-compatible `text` field, so a Slack incoming webhook or any
+  // generic JSON receiver works unchanged. The treasury monitor only runs
+  // when ALERT_TREASURY_MIN_USDC is also set.
+  alerting: Object.freeze({
+    webhookUrl: process.env.ALERT_WEBHOOK_URL || '',
+    treasuryMinUsdc: num(process.env.ALERT_TREASURY_MIN_USDC, null),
+    treasuryIntervalMs: num(process.env.ALERT_TREASURY_INTERVAL_MS, 5 * 60 * 1000),
   }),
 
   push: Object.freeze({

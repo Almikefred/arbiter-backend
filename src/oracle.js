@@ -12,6 +12,7 @@ import { notifyWorker } from './push.js';
 import { enqueueSettlementWebhooks } from './webhookDelivery.js';
 import { setJobWebhookOwner } from './webhooks.js';
 import { jobLogger } from './logger.js';
+import { raiseAlert } from './alerting.js';
 import { store } from './store.js';
 import { buildProvenanceRecord, saveProvenance, attachSettlement } from './provenance.js';
 import { config } from './config.js';
@@ -253,6 +254,10 @@ function runFulfillment(questionId, pending, tier) {
     // returning; this catch is a last-resort net so a bug there can't leave
     // the job record stuck in 'awaiting_workers' forever.
     jobLogger(questionId).error({ err }, 'fulfillment crashed unexpectedly');
+    raiseAlert('fulfillment_crashed', `fulfillment crashed for question ${questionId}`, {
+      questionId,
+      error: err.message,
+    });
     updateJob(questionId, {
       status: 'settled',
       outcome: 'refund_pending_timeout',
@@ -662,6 +667,10 @@ async function settleRefunded(questionId, submissions, result, extraJobFields = 
         { err },
         "refund() ALSO failed — payer can fall back to refund_timeout()",
       );
+      raiseAlert('refund_pending_timeout', `refund() failed for question ${questionId}; payer must wait for refund_timeout()`, {
+        questionId,
+        error: err.message,
+      });
       return null;
     });
 

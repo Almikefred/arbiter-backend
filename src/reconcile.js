@@ -1,7 +1,8 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { config } from './config.js';
 import { logger } from './logger.js';
-import { numericToleranceVote, describeTolerance } from './consensus.js';
+import { numericToleranceVote } from './consensus.js';
+import { llmProvider } from './llmProvider.js';
+
+export { buildReconcileRequest, buildDraftRequest } from './llmProvider.js';
 
 function normalize(text) {
   return text
@@ -112,129 +113,44 @@ export function clusterVote(submissions) {
   };
 }
 
-const REPORT_CONSENSUS_TOOL = {
-  name: 'report_consensus',
-  description:
-    'Report the reconciled consensus answer across multiple human worker submissions for the same question.',
-  input_schema: {
-    type: 'object',
-    properties: {
-      consensus: { type: 'string', description: 'The single best consensus answer text.' },
-      confidence: {
-        type: 'number',
-        minimum: 0,
-        maximum: 1,
-        description: 'Confidence 0-1 that this is the correct majority answer.',
-      },
-      matching_worker_ids: {
-        type: 'array',
-        items: { type: 'string' },
-        description: "IDs of workers whose answers match the winning plurality (paraphrases count as matches).",
-      },
-    },
-    required: ['consensus', 'confidence', 'matching_worker_ids'],
-  },
-};
+async function reconcileWithClaude(question, submissions, rule = null) {
+  const { consensus, confidence, matchingWorkerIds, llm } = await llmProvider.reportConsensus(question, submissions, rule);
+  return { consensus, confidence, matchingWorkerIds, method: 'claude', llm };
+}
 
-let anthropicClient = null;
-function getClient() {
-  if (!config.anthropicApiKey) return null;
-  if (!anthropicClient) {
-    // The SDK's own defaults (2 retries, but a 10-MINUTE timeout) are tuned
-    // for long-running batch/agentic use, not a call sitting in the
-    // critical path of settling a question with a fail-closed fallback
-    // waiting behind it. Keep the SDK's built-in retry (it already handles
-    // backoff + which errors are retryable correctly) but cut the ceiling
-    // down to something that fails fast enough to still hit the
-    // deterministic vote fallback promptly if Claude is genuinely down.
-    anthropicClient = new Anthropic({ apiKey: config.anthropicApiKey, timeout: 15_000, maxRetries: 2 });
-  }
-  return anthropicClient;
+async function draftWithOpenAI(question) {
+  const request = buildOpenAIDraftRequest(question);
+  const response = captureOpenAIResponse(await postOpenAI(request));
+
+  const toolUse = response.content.find((b) => b.name === 'report_draft');
+  if (!toolUse) throw new Error('OpenAI did not return a report_draft tool call');
+
+  const { answer, confidence } = toolUse.input;
+  if (typeof answer !== 'string') throw new Error('OpenAI report_draft tool call was missing an answer');
+  return {
+    consensus: answer,
+    confidence,
+    matchingWorkerIds: [],
+    method: 'llm-draft-openai',
+    llm: { request, response },
+  };
 }
 
 /**
- * Builds the exact Messages API request body used for reconciliation. Pure
- * and exported so provenance.js (and any third-party verifier) can rebuild
- * it from the committed submissions and confirm, byte for byte, that the
- * prompt Claude actually saw contained exactly those submissions.
+ * LLM providers in fallback order, primary first. An unconfigured provider
+ * is skipped; a configured one that throws (transport error, timeout, or a
+ * missing/malformed tool call) hands off to the next. Only when every
+ * configured provider has failed does the caller use its deterministic path.
  */
-export function buildReconcileRequest(question, submissions, model = config.anthropicModel, rule = null) {
-  const submissionsText = submissions.map((s) => `Worker ${s.workerId}: "${s.answer}"`).join('\n');
-  // Only non-default rules add anything to the prompt, so the default
-  // mode's Claude call is unchanged.
-  const ruleText =
-    rule?.mode === 'numeric-tolerance'
-      ? ` The asker requested numeric matching: treat numeric answers ${describeTolerance(rule.tolerance)} as matches.`
-      : '';
-  return {
-    model,
-    max_tokens: 512,
-    tool_choice: { type: 'tool', name: 'report_consensus' },
-    tools: [REPORT_CONSENSUS_TOOL],
-    messages: [
-      {
-        role: 'user',
-        content:
-          `Question: "${question}"\n\nWorker answers:\n${submissionsText}\n\n` +
-          'Reconcile these into a single consensus answer. Treat paraphrases, case ' +
-          'differences, and whitespace differences as matches. If the workers genuinely ' +
-          "disagree, pick the winning plurality, lower the confidence accordingly, and only " +
-          "list the winning plurality's worker ids in matching_worker_ids." +
-          ruleText,
-      },
-    ],
-  };
-}
+const RECONCILE_PROVIDERS = [
+  { configured: () => Boolean(config.anthropicApiKey), run: reconcileWithClaude },
+  { configured: () => Boolean(config.openaiApiKey), run: reconcileWithOpenAI },
+];
 
-/** The parts of a Messages API response worth preserving for provenance —
- * enough to re-read the tool call, without SDK-internal fields. */
-function captureResponse(message) {
-  return { id: message.id, model: message.model, stop_reason: message.stop_reason, content: message.content };
-}
-
-async function reconcileWithClaude(question, submissions, rule = null) {
-  const client = getClient();
-  if (!client) throw new Error('ANTHROPIC_API_KEY not configured');
-
-  const request = buildReconcileRequest(question, submissions, config.anthropicModel, rule);
-  const message = await client.messages.create(request);
-
-  const toolUse = message.content.find((b) => b.type === 'tool_use' && b.name === 'report_consensus');
-  if (!toolUse) throw new Error('Claude did not return a report_consensus tool call');
-
-  const { consensus, confidence, matching_worker_ids: matchingWorkerIds } = toolUse.input;
-  return { consensus, confidence, matchingWorkerIds, method: 'claude', llm: { request, response: captureResponse(message) } };
-}
-
-const REPORT_DRAFT_TOOL = {
-  name: 'report_draft',
-  description: 'Report a direct draft answer to a question, with a self-assessed confidence.',
-  input_schema: {
-    type: 'object',
-    properties: {
-      answer: { type: 'string', description: 'The best direct answer to the question.' },
-      confidence: {
-        type: 'number',
-        minimum: 0,
-        maximum: 1,
-        description: 'Self-assessed confidence 0-1 that this answer is correct.',
-      },
-    },
-    required: ['answer', 'confidence'],
-  },
-};
-
-/** Same idea as buildReconcileRequest(): the exact instant-tier request
- * body, rebuildable by a verifier from the committed question alone. */
-export function buildDraftRequest(question, model = config.anthropicModel) {
-  return {
-    model,
-    max_tokens: 512,
-    tool_choice: { type: 'tool', name: 'report_draft' },
-    tools: [REPORT_DRAFT_TOOL],
-    messages: [{ role: 'user', content: `Question: "${question}"\n\nGive your best direct answer.` }],
-  };
-}
+const DRAFT_PROVIDERS = [
+  { configured: () => Boolean(config.anthropicApiKey), run: draftWithClaude },
+  { configured: () => Boolean(config.openaiApiKey), run: draftWithOpenAI },
+];
 
 /**
  * The `instant` tier's entire fulfillment path — no worker submissions
@@ -249,37 +165,34 @@ export function buildDraftRequest(question, model = config.anthropicModel) {
  * (see oracle.js's fulfillOracleCall); `purpose` only labels the logs.
  */
 export async function draftAnswer(question, questionId, { purpose = 'instant-tier' } = {}) {
-  const client = getClient();
-  if (!client) {
-    logger.warn({ questionId, purpose }, `${purpose} draft requested but ANTHROPIC_API_KEY not configured`);
+  if (!llmProvider.isConfigured()) {
+    logger.warn({ questionId, purpose }, `${purpose} draft requested but LLM provider "${llmProvider.name}" not configured`);
     return null;
   }
 
   try {
-    const request = buildDraftRequest(question);
-    const message = await client.messages.create(request);
+    const draft = await llmProvider.reportDraft(question);
+    if (!draft) return null;
 
-    const toolUse = message.content.find((b) => b.type === 'tool_use' && b.name === 'report_draft');
-    if (!toolUse) return null;
-
-    const { answer, confidence } = toolUse.input;
     return {
-      consensus: answer,
-      confidence,
+      consensus: draft.answer,
+      confidence: draft.confidence,
       matchingWorkerIds: [],
       method: 'llm-draft',
-      llm: { request, response: captureResponse(message) },
+      llm: draft.llm,
     };
   } catch (err) {
     logger.error({ err, questionId, purpose }, `${purpose} draft answer failed`);
     return null;
   }
+  return null;
 }
 
 /**
  * reconcile() never throws and never hangs indefinitely on an external API
- * outage — any Claude error falls back to a deterministic vote so the
- * caller can always settle the escrow one way or the other.
+ * outage — LLM providers are tried in order (Claude, then OpenAI), and only
+ * when every configured one has failed does it fall back to a deterministic
+ * vote so the caller can always settle the escrow one way or the other.
  *
  * Fast path: if every worker's answer clusters together (near-duplicate
  * phrasing counts as agreement) AND every one of those workers is
@@ -322,17 +235,22 @@ export async function reconcile(question, submissions, questionId, rule = null) 
     };
   }
 
-  try {
-    return await reconcileWithClaude(question, submissions, rule);
-  } catch (err) {
-    logger.error({ err, questionId }, 'Claude reconciliation failed, falling back to cluster vote');
-    return {
-      consensus: vote.consensus,
-      confidence: vote.confidence,
-      matchingWorkerIds: vote.matchingWorkerIds,
-      method: 'cluster-fallback',
-    };
+  for (const provider of RECONCILE_PROVIDERS) {
+    if (!provider.configured()) continue;
+    try {
+      return await provider.run(question, submissions, rule);
+    } catch (err) {
+      logger.error({ err, questionId }, 'LLM reconciliation failed, trying next provider');
+    }
   }
+
+  logger.error({ questionId }, 'no LLM reconciliation provider answered, falling back to cluster vote');
+  return {
+    consensus: vote.consensus,
+    confidence: vote.confidence,
+    matchingWorkerIds: vote.matchingWorkerIds,
+    method: 'cluster-fallback',
+  };
 }
 
 /**
