@@ -115,14 +115,32 @@ export function volumeDiscountMultiplier(volume) {
   return multiplier;
 }
 
+/**
+ * Priority queue-jump surcharge (issue #81). A `priority`-tier question pays
+ * this multiplier on top of its surge-adjusted price in exchange for being
+ * ordered ahead of standard-tier questions in dispatch's per-worker queue.
+ *
+ * Deliberately a pure function of the tier key so it can be snapshotted at
+ * quote time (see priceForTier) — the surcharge is baked into the quoted
+ * priceStroops, so a payer can't observe live queue state and then decide to
+ * pay for a jump after the fact. Non-priority tiers get exactly 1 (no
+ * surcharge), so standard/express/instant pricing is unchanged.
+ */
+export const PRIORITY_QUEUE_JUMP_MULTIPLIER = 1.25;
+
+export function priorityQueueJumpMultiplier(tierKey) {
+  return resolveTier(tierKey).key === 'priority' ? PRIORITY_QUEUE_JUMP_MULTIPLIER : 1;
+}
+
 /** Snapshots a tier's live, surge-adjusted price. Callers must persist the
  * returned priceStroops (not just the tier key) alongside the question, so
  * later payment verification checks against the price actually quoted. */
 export function priceForTier(tierKey, onlineWorkers) {
   const tier = resolveTier(tierKey);
   const multiplier = surgeMultiplier(tier, onlineWorkers);
-  const priceStroops = BigInt(Math.round(Number(tier.priceStroops) * multiplier));
-  return { ...tier, priceStroops, surgeMultiplier: multiplier };
+  const jumpMultiplier = priorityQueueJumpMultiplier(tier.key);
+  const priceStroops = BigInt(Math.round(Number(tier.priceStroops) * multiplier * jumpMultiplier));
+  return { ...tier, priceStroops, surgeMultiplier: multiplier, priorityQueueJumpMultiplier: jumpMultiplier };
 }
 
 /**
@@ -139,4 +157,3 @@ export function priceForTierWithVolumeDiscount(tierKey, onlineWorkers, volume) {
   const priceStroops = BigInt(Math.round(Number(priced.priceStroops) * discountMultiplier));
   return { ...priced, priceStroops, discountMultiplier };
 }
-

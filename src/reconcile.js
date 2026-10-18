@@ -118,6 +118,40 @@ async function reconcileWithClaude(question, submissions, rule = null) {
   return { consensus, confidence, matchingWorkerIds, method: 'claude', llm };
 }
 
+async function draftWithOpenAI(question) {
+  const request = buildOpenAIDraftRequest(question);
+  const response = captureOpenAIResponse(await postOpenAI(request));
+
+  const toolUse = response.content.find((b) => b.name === 'report_draft');
+  if (!toolUse) throw new Error('OpenAI did not return a report_draft tool call');
+
+  const { answer, confidence } = toolUse.input;
+  if (typeof answer !== 'string') throw new Error('OpenAI report_draft tool call was missing an answer');
+  return {
+    consensus: answer,
+    confidence,
+    matchingWorkerIds: [],
+    method: 'llm-draft-openai',
+    llm: { request, response },
+  };
+}
+
+/**
+ * LLM providers in fallback order, primary first. An unconfigured provider
+ * is skipped; a configured one that throws (transport error, timeout, or a
+ * missing/malformed tool call) hands off to the next. Only when every
+ * configured provider has failed does the caller use its deterministic path.
+ */
+const RECONCILE_PROVIDERS = [
+  { configured: () => Boolean(config.anthropicApiKey), run: reconcileWithClaude },
+  { configured: () => Boolean(config.openaiApiKey), run: reconcileWithOpenAI },
+];
+
+const DRAFT_PROVIDERS = [
+  { configured: () => Boolean(config.anthropicApiKey), run: draftWithClaude },
+  { configured: () => Boolean(config.openaiApiKey), run: draftWithOpenAI },
+];
+
 /**
  * The `instant` tier's entire fulfillment path — no worker submissions
  * exist to reconcile, this generates the answer directly. Deliberately a
@@ -151,12 +185,14 @@ export async function draftAnswer(question, questionId, { purpose = 'instant-tie
     logger.error({ err, questionId, purpose }, `${purpose} draft answer failed`);
     return null;
   }
+  return null;
 }
 
 /**
  * reconcile() never throws and never hangs indefinitely on an external API
- * outage — any Claude error falls back to a deterministic vote so the
- * caller can always settle the escrow one way or the other.
+ * outage — LLM providers are tried in order (Claude, then OpenAI), and only
+ * when every configured one has failed does it fall back to a deterministic
+ * vote so the caller can always settle the escrow one way or the other.
  *
  * Fast path: if every worker's answer clusters together (near-duplicate
  * phrasing counts as agreement) AND every one of those workers is
@@ -199,17 +235,22 @@ export async function reconcile(question, submissions, questionId, rule = null) 
     };
   }
 
-  try {
-    return await reconcileWithClaude(question, submissions, rule);
-  } catch (err) {
-    logger.error({ err, questionId }, 'Claude reconciliation failed, falling back to cluster vote');
-    return {
-      consensus: vote.consensus,
-      confidence: vote.confidence,
-      matchingWorkerIds: vote.matchingWorkerIds,
-      method: 'cluster-fallback',
-    };
+  for (const provider of RECONCILE_PROVIDERS) {
+    if (!provider.configured()) continue;
+    try {
+      return await provider.run(question, submissions, rule);
+    } catch (err) {
+      logger.error({ err, questionId }, 'LLM reconciliation failed, trying next provider');
+    }
   }
+
+  logger.error({ questionId }, 'no LLM reconciliation provider answered, falling back to cluster vote');
+  return {
+    consensus: vote.consensus,
+    confidence: vote.confidence,
+    matchingWorkerIds: vote.matchingWorkerIds,
+    method: 'cluster-fallback',
+  };
 }
 
 /**
