@@ -166,14 +166,11 @@ export const config = Object.freeze({
   // README can distinguish the two environments unambiguously.
   deploymentProfile,
 
-  // LLM providers for reconciliation and the instant tier (#68). Anthropic is
-  // primary; OpenAI is tried only when Anthropic is unconfigured or fails. A
-  // provider with no key is skipped, never an error — with neither key set,
-  // reconcile() and draftAnswer() fall back exactly as before.
+  // LLM provider behind reconcile()/draftAnswer() (see llmProvider.js).
+  // 'anthropic' is the only implementation today; unknown values fail at startup.
+  llmProvider: process.env.LLM_PROVIDER || 'anthropic',
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
-  anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5-5',
-  openaiApiKey: process.env.OPENAI_API_KEY || '',
-  openaiModel: process.env.OPENAI_MODEL || 'gpt-4o',
+  anthropicModel: process.env.CLAUDE_MODEL || 'claude-sonnet-5-5',
 
   usdc: Object.freeze({
     sacId: process.env.USDC_SAC_ID || '',
