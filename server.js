@@ -34,70 +34,33 @@ app.use(express.static(path.join(__dirname, 'dist')));
 // re-calls the subscribe endpoint after a restart.
 const { rebuildSubscribedWorkers } = require('./push');
 
-// Attach a WebSocket dispatch transport to the same HTTP server that serves
-// the SSE route (GET /app/events). Workers may connect over either transport;
-// dispatch.js treats both uniformly via its transport-agnostic sendToWorker().
-function attachWebSocketServer(server) {
-  const wss = new WebSocketServer({ server, path: '/app/ws' });
-  wss.on('connection', (ws, req) => {
-    const { registerWebSocketWorker } = require('./dispatch');
-    registerWebSocketWorker(ws, req);
-  });
-  return wss;
+// Dedicated rate limit for the sponsor onboarding route. Each call to
+// buildSponsoredOnboardTx (src/sponsor.js) spends a real sponsored-reserve
+// transaction, so it must not share the generic 'sponsor' bucket used by
+// cheaper sponsor endpoints. This is intentionally stricter than the generic
+// wrapper: a small per-IP window caps how much reserve a single client can
+// burn even if the generic limiter is loosened elsewhere.
+const SPONSOR_ONBOARD_WINDOW_MS = 60 * 1000;
+const SPONSOR_ONBOARD_MAX = 5;
+const sponsorOnboardHits = new Map();
+
+function rateLimitedSponsorOnboard(req, res, next) {
+  const now = Date.now();
+  const key = req.ip || req.connection?.remoteAddress || 'unknown';
+  const entry = sponsorOnboardHits.get(key);
+  if (!entry || now - entry.start >= SPONSOR_ONBOARD_WINDOW_MS) {
+    sponsorOnboardHits.set(key, { start: now, count: 1 });
+    return next();
+  }
+  if (entry.count >= SPONSOR_ONBOARD_MAX) {
+    res.set('Retry-After', String(Math.ceil((entry.start + SPONSOR_ONBOARD_WINDOW_MS - now) / 1000)));
+    return res.status(429).json({ error: 'Too many sponsor onboarding requests' });
+  }
+  entry.count += 1;
+  return next();
 }
 
-// POST /oracle/batch — accept an array of { question, tier, category } items
-// and process each through the same single-question path, but consume the
-// rate-limit budget once for the whole batch (dedicated oracleBatch bucket).
-// Partial-success semantics: each item reports its own result/error so one
-// malformed item never drops or mis-attributes the others.
-app.post('/oracle/batch', async (req, res) => {
-  const config = require('./config');
-  const { rateLimited } = require('./rateLimit');
-  const oracle = require('./oracle');
-
-  const items = req.body && Array.isArray(req.body.questions) ? req.body.questions : null;
-  if (!items) {
-    return res.status(400).json({ error: 'body.questions must be an array' });
-  }
-
-  const maxBatch = (config.rateLimits && config.rateLimits.oracleBatch && config.rateLimits.oracleBatch.maxItems) || 50;
-  if (items.length === 0) {
-    return res.status(400).json({ error: 'questions array must not be empty' });
-  }
-  if (items.length > maxBatch) {
-    return res.status(400).json({ error: `batch size ${items.length} exceeds max ${maxBatch}` });
-  }
-
-  // One rate-limit consumption for the whole batch.
-  const limiter = rateLimited('oracleBatch', (r) => r.ip);
-  return limiter(req, res, async () => {
-    const results = [];
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (!item || typeof item.question !== 'string' || item.question.length === 0) {
-        results.push({ index: i, ok: false, error: 'missing question' });
-        continue;
-      }
-      if (config.maxQuestionLength && item.question.length > config.maxQuestionLength) {
-        results.push({ index: i, ok: false, error: 'question too long' });
-        continue;
-      }
-      try {
-        const result = await oracle.issueChallengeIdempotent({
-          question: item.question,
-          tier: item.tier,
-          category: item.category,
-          req,
-        });
-        results.push({ index: i, ok: true, result });
-      } catch (err) {
-        results.push({ index: i, ok: false, error: err && err.message ? err.message : 'failed' });
-      }
-    }
-    return res.json({ results });
-  });
-});
+app.use('/api/sponsor/onboard', rateLimitedSponsorOnboard);
 
 async function start() {
   await rebuildSubscribedWorkers();

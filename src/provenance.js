@@ -43,6 +43,18 @@ export {
  * own reputation record. A verifier can confirm the fast path was applied
  * consistently with those flags, but not that the flags themselves are
  * right.
+ *
+ * Call-order guarantee (issue #335): commitProvenance() must run before
+ * resolveQuestion()/refundQuestion() on EVERY settlement path — instant,
+ * human-quorum, dispatch-pause, and cancel — not just the common one. The
+ * commitment is only meaningful if it exists before the on-chain
+ * resolve()/refund() is broadcast; a path that settles first and commits
+ * after would leave a window where the answer is final on-chain but has no
+ * committed provenance, defeating the tamper-evidence and re-derivation
+ * guarantees above. commitProvenance() therefore refuses to run once a
+ * settlement has already been attached, so any path that gets the order
+ * wrong fails loudly here instead of silently producing an unverifiable
+ * settlement.
  */
 
 const KEY_PREFIX = 'provenance:';
@@ -74,6 +86,25 @@ export function buildProvenanceRecord({ questionId, question, tier, submissions,
   };
 }
 
+/**
+ * Commits the provenance record for a question. Must be called before
+ * resolveQuestion()/refundQuestion() on every settlement path (instant,
+ * human-quorum, dispatch-pause, cancel). If a settlement has already been
+ * attached for this question, the call order was wrong — throw rather than
+ * overwrite, so the misordered path is caught instead of silently settling
+ * without a valid commitment.
+ */
+export async function commitProvenance(questionId, record) {
+  const existing = await store.get(KEY_PREFIX + questionId);
+  if (existing && existing.settlement) {
+    throw new Error(
+      `commitProvenance(${questionId}) called after settlement was attached; ` +
+        'provenance must be committed before resolveQuestion()/refundQuestion()'
+    );
+  }
+  return saveProvenance(questionId, record);
+}
+
 export async function saveProvenance(questionId, record) {
   const hash = hashRecord(record);
   // No TTL, unlike job records: provenance exists for disputes, which can
@@ -95,4 +126,3 @@ export async function attachSettlement(questionId, settlement) {
 export async function getProvenance(questionId) {
   return store.get(KEY_PREFIX + questionId);
 }
-
